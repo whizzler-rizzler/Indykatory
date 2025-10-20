@@ -25,11 +25,18 @@ dbg.setLevel(logging.DEBUG)
 SYMBOL = "BTCUSDT"
 CANDLE_INTERVAL_MIN = 5  # 5-minutowe świece
 BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_5m"
-BINANCE_REST_URL = "https://api.binance.com/api/v3/klines"
+BINANCE_REST_URL = "https://data.binance.com/api/v3/klines"  # Historical candles
+BINANCE_TICKER_URL = "https://data.binance.com/api/v3/ticker/price?symbol=BTCUSDT"  # Current price co 10s!
+KRAKEN_REST_URL = "https://api.kraken.com/0/public/OHLC"  # Fallback jeśli Binance zablokowany
 DB_PATH = "logs/indicators_cache.db"  # SQLite fallback
-UPDATE_INTERVAL_S = 60  # Aktualizacja wskaźników co 60s
+UPDATE_INTERVAL_S = 10  # Aktualizacja wskaźników co 10s (real-time monitoring!)
+CANDLE_REFRESH_INTERVAL_S = 60  # Pobieranie nowych świec co 60s (nie przeciążać serwera)
 CANDLE_BUFFER_SIZE = 100  # Ile świec 5-min przechowywać (500 min = 8h 20min)
-VOLATILITY_WINDOW = 20  # Ile świec używać do obliczeń (100 min = 1h 40min)
+
+# STANDARDOWE OKRESY (FIXED) - 6 wskaźników
+OHLC_PERIODS = [50, 25]  # OHLC dla 50 i 25 świec
+ATR_LENGTHS = [14, 28]   # ATR dla 14 i 28 okresów
+C2C_PERIODS = [50, 25]   # Close-to-Close dla 50 i 25 świec
 
 # PostgreSQL (Railway) - auto-detect
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this
@@ -207,7 +214,7 @@ class IndicatorEngine:
     
     @staticmethod
     def calculate_close_to_close_volatility(candles: List[Dict]) -> float:
-        """Close-to-Close Volatility (Annualized) = StdDev(log returns) * sqrt(252) * 100"""
+        """Close-to-Close Volatility (Annualized) - TradingView Compatible"""
         if len(candles) < 2:
             return 0.0
         
@@ -222,26 +229,24 @@ class IndicatorEngine:
         if not log_returns:
             return 0.0
         
-        # Standard deviation (bez odejmowania średniej - assumption: zero drift dla crypto intraday)
-        variance = sum(r ** 2 for r in log_returns) / len(log_returns)
+        n = len(log_returns)
+        
+        # Sample standard deviation (n-1 for unbiased estimator)
+        mean = sum(log_returns) / n
+        variance = sum((r - mean) ** 2 for r in log_returns) / (n - 1) if n > 1 else 0
         std_dev = math.sqrt(variance)
         
-        # Annualizacja: 5-min świece, 288 świec/dzień (24h crypto), 252 dni handlowe
-        # sqrt(252 * 288) = sqrt(72576) ≈ 269.4
-        ANNUALIZATION_FACTOR = 269.4
+        # TradingView annualizacja: sqrt(252) dla daily-based (nie intraday 24/7!)
+        ANNUAL_PERIODS = 252  # Trading days per year (standard market convention)
         
-        volatility_pct = std_dev * ANNUALIZATION_FACTOR * 100
+        volatility_pct = std_dev * math.sqrt(ANNUAL_PERIODS) * 100
         return volatility_pct
     
     @staticmethod
     def calculate_ohlc_volatility(candles: List[Dict]) -> float:
-        """Garman-Klass OHLC Volatility (Annualized)"""
+        """Garman-Klass OHLC Volatility (Annualized) - TradingView Compatible"""
         if len(candles) < 2:
             return 0.0
-        
-        # Garman-Klass formula:
-        # σ² = (1/n) * Σ[ 0.5 * ln(H/L)² - (2*ln(2)-1) * ln(C/O)² ]
-        # σ_annual = σ * sqrt(252 * periods_per_day)
         
         n = len(candles)
         sum_variance = 0.0
@@ -263,49 +268,81 @@ class IndicatorEngine:
         if sum_variance <= 0:
             return 0.0
         
-        # Average variance per period
-        avg_variance = sum_variance / n
+        # Sample variance: divide by (n-1) for unbiased estimator
+        avg_variance = sum_variance / (n - 1) if n > 1 else sum_variance
         
-        # Annualize: 5-min candles, 288 periods/day, 252 trading days
-        # Factor = 252 * 288 / n (where n is lookback window)
-        PERIODS_PER_DAY = 288  # 24h * 60min / 5min
-        TRADING_DAYS = 252
-        annualization_factor = (TRADING_DAYS * PERIODS_PER_DAY) / n
+        # TradingView crypto 24/7 annualizacja dla intraday range-based volatility:
+        # Używa calendar days (365) zamiast trading days (252) bo crypto działa 24/7
+        # Plus scaling dla 5-min candles (288 okresów/dzień)
+        CALENDAR_DAYS = 365  # Crypto trades 24/7/365
+        PERIODS_PER_DAY = 288  # 5-min candles: 24h * 60min / 5min
         
-        annualized_variance = avg_variance * annualization_factor
+        annualized_variance = avg_variance * CALENDAR_DAYS * PERIODS_PER_DAY
         volatility_pct = math.sqrt(annualized_variance) * 100
         
         return volatility_pct
     
     @staticmethod
-    def calculate_chaikin_volatility(candles: List[Dict], ema_period: int = 10) -> float:
-        """Chaikin Volatility = ((EMA_HL - EMA_HL_prev) / EMA_HL_prev) * 100"""
-        if len(candles) < ema_period + 1:
+    def calculate_atr(candles: List[Dict], period: int = 14) -> float:
+        """ATR (Average True Range) - TradingView compatible with RMA smoothing"""
+        if len(candles) < period + 1:
             return 0.0
         
-        hl_values = [c['high'] - c['low'] for c in candles]
+        # Calculate True Range for each candle
+        true_ranges = []
+        for i in range(1, len(candles)):
+            high = candles[i]['high']
+            low = candles[i]['low']
+            prev_close = candles[i-1]['close']
+            
+            # True Range = max(high-low, |high-prev_close|, |low-prev_close|)
+            tr1 = high - low
+            tr2 = abs(high - prev_close)
+            tr3 = abs(low - prev_close)
+            
+            true_range = max(tr1, tr2, tr3)
+            true_ranges.append(true_range)
         
-        multiplier = 2 / (ema_period + 1)
-        ema = hl_values[0]
-        ema_values = [ema]
-        
-        for hl in hl_values[1:]:
-            ema = hl * multiplier + ema * (1 - multiplier)
-            ema_values.append(ema)
-        
-        if len(ema_values) < 2 or ema_values[-2] == 0:
+        if len(true_ranges) < period:
             return 0.0
         
-        chaikin = ((ema_values[-1] - ema_values[-2]) / ema_values[-2]) * 100
-        return abs(chaikin)
+        # TradingView uses RMA (Running Moving Average) for ATR
+        # RMA is similar to EMA: alpha = 1/period
+        # First ATR = SMA of first 'period' values
+        # Then: ATR = (previous_ATR * (period-1) + current_TR) / period
+        
+        # Initial ATR (SMA of first 'period' TR values)
+        atr = sum(true_ranges[:period]) / period
+        
+        # Apply RMA for remaining values
+        for i in range(period, len(true_ranges)):
+            atr = (atr * (period - 1) + true_ranges[i]) / period
+        
+        return atr
     
     @classmethod
     def calculate_all(cls, candles: List[Dict]) -> Dict:
-        """Oblicz wszystkie wskaźniki"""
+        """Oblicz wszystkie 6 wskaźników (FIXED PERIODS)"""
+        
+        # OHLC - 2 wartości (50 i 25 świec)
+        ohlc_50 = round(cls.calculate_ohlc_volatility(candles[-50:] if len(candles) >= 50 else candles), 4)
+        ohlc_25 = round(cls.calculate_ohlc_volatility(candles[-25:] if len(candles) >= 25 else candles), 4)
+        
+        # ATR - 2 wartości (14 i 28 length)
+        atr_14 = round(cls.calculate_atr(candles, period=14), 2)
+        atr_28 = round(cls.calculate_atr(candles, period=28), 2)
+        
+        # Close-to-Close - 2 wartości (50 i 25 świec)
+        c2c_50 = round(cls.calculate_close_to_close_volatility(candles[-50:] if len(candles) >= 50 else candles), 4)
+        c2c_25 = round(cls.calculate_close_to_close_volatility(candles[-25:] if len(candles) >= 25 else candles), 4)
+        
         return {
-            'close_to_close': round(cls.calculate_close_to_close_volatility(candles), 4),
-            'ohlc': round(cls.calculate_ohlc_volatility(candles), 4),
-            'chaikin': round(cls.calculate_chaikin_volatility(candles), 4),
+            'ohlc_50': ohlc_50,
+            'ohlc_25': ohlc_25,
+            'atr_14': atr_14,
+            'atr_28': atr_28,
+            'c2c_50': c2c_50,
+            'c2c_25': c2c_25,
             'candles_count': len(candles),
         }
 
@@ -366,8 +403,56 @@ class DataFetcher:
         self.lighter_ws_url = "wss://mainnet.zklighter.elliot.ai/stream"
         self.lighter_candle_builder = LighterCandleBuilder(interval_min)
     
+    async def fetch_kraken_rest(self, limit: int = 50) -> List[Dict]:
+        """Pobierz świece z Kraken API (publiczny, bez geo-blokady)"""
+        try:
+            # Kraken używa różnych symboli: BTC=XBT, USDT=USDT
+            kraken_pair = "XBTUSDT"  # BTC/USDT na Kraken
+            params = {
+                'pair': kraken_pair,
+                'interval': self.interval_min,  # 5 = 5 min
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(KRAKEN_REST_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status != 200:
+                        log.error(f"❌ Kraken REST error: status={resp.status}")
+                        return []
+                    
+                    data = await resp.json()
+                    
+                    if data.get('error') and len(data['error']) > 0:
+                        log.error(f"❌ Kraken API error: {data['error']}")
+                        return []
+                    
+                    result = data.get('result', {})
+                    ohlc_data = result.get(kraken_pair, [])
+                    
+                    if not ohlc_data:
+                        log.error(f"❌ No Kraken data for {kraken_pair}")
+                        return []
+                    
+                    # Kraken format: [timestamp, open, high, low, close, vwap, volume, count]
+                    candles = []
+                    for item in ohlc_data[-limit:]:  # Ostatnie N świec
+                        candles.append({
+                            'time': int(item[0]),
+                            'open': float(item[1]),
+                            'high': float(item[2]),
+                            'low': float(item[3]),
+                            'close': float(item[4]),
+                        })
+                    
+                    log.info(f"✅ Kraken REST: pobrano {len(candles)} świec {self.interval_min}m")
+                    return candles
+        
+        except Exception as e:
+            log.error(f"❌ Kraken REST error: {e}")
+            return []
+    
     async def fetch_rest(self, limit: int = 50) -> List[Dict]:
-        """Pobierz świece z REST API (fallback)"""
+        """Pobierz świece z REST API - PRIMARY: BINANCE, FALLBACK: Kraken"""
+        # BINANCE PRIMARY - zawsze próbuj najpierw!
         try:
             params = {
                 'symbol': self.symbol,
@@ -377,27 +462,59 @@ class DataFetcher:
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(BINANCE_REST_URL, params=params, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status != 200:
-                        log.error(f"❌ Binance REST error: status={resp.status}")
-                        return []
-                    
-                    data = await resp.json()
-                    candles = []
-                    for kline in data:
-                        candles.append({
-                            'time': int(kline[0]) / 1000,
-                            'open': float(kline[1]),
-                            'high': float(kline[2]),
-                            'low': float(kline[3]),
-                            'close': float(kline[4]),
-                        })
-                    
-                    log.info(f"✅ REST: pobrano {len(candles)} świec {self.interval_min}m")
-                    return candles
+                    if resp.status == 200:
+                        data = await resp.json()
+                        candles = []
+                        for kline in data:
+                            candles.append({
+                                'time': int(kline[0]) / 1000,
+                                'open': float(kline[1]),
+                                'high': float(kline[2]),
+                                'low': float(kline[3]),
+                                'close': float(kline[4]),
+                            })
+                        
+                        log.info(f"✅ Binance REST (PRIMARY): pobrano {len(candles)} świec {self.interval_min}m")
+                        return candles
+                    else:
+                        log.warning(f"⚠️ Binance REST status={resp.status} - trying Kraken fallback")
         
         except Exception as e:
-            log.error(f"❌ REST fetch error: {e}")
-            return []
+            log.warning(f"⚠️ Binance REST error: {e} - trying Kraken fallback")
+        
+        # KRAKEN FALLBACK - tylko jeśli Binance nie działa
+        candles = await self.fetch_kraken_rest(limit)
+        if candles:
+            return candles
+        
+        return []
+    
+    async def fetch_current_price(self) -> Optional[float]:
+        """Pobierz CURRENT PRICE z Binance ticker (do aktualizacji wskaźników co 10s!)"""
+        # BINANCE PRIMARY
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(BINANCE_TICKER_URL, timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = float(data["price"])
+                        return price
+        except Exception as e:
+            pass  # Silent fail - spróbuj Kraken
+        
+        # KRAKEN FALLBACK
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSDT", 
+                                      timeout=aiohttp.ClientTimeout(total=3)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        price = float(data["result"]["XBTUSDT"]["c"][0])  # Last trade price
+                        return price
+        except Exception as e:
+            log.error(f"❌ Failed to fetch current price: {e}")
+        
+        return None
     
     async def stream_websocket(self, aggregator: CandleAggregator, storage: IndicatorsStorage, engine: IndicatorEngine):
         """Stream świec z WebSocket (primary source - Binance)"""
@@ -427,12 +544,14 @@ class DataFetcher:
                                         aggregator.add_candle(candle)
                                         storage.save_candle_history(self.symbol, f"{self.interval_min}m", candle)
                                         
-                                        recent_candles = aggregator.get_recent_candles(VOLATILITY_WINDOW)
-                                        indicators = engine.calculate_all(recent_candles)
+                                        # Oblicz 6 wskaźników używając wszystkich świec
+                                        all_candles = list(aggregator.candles)
+                                        indicators = engine.calculate_all(all_candles)
                                         storage.save_indicators(self.symbol, f"{self.interval_min}m", indicators)
                                         
-                                        log.info(f"📊 [Binance] Indicators: C2C={indicators['close_to_close']:.2f}% "
-                                                f"OHLC={indicators['ohlc']:.2f}% Chaikin={indicators['chaikin']:.2f}")
+                                        log.info(f"📊 [Binance] OHLC: 50={indicators['ohlc_50']:.2f}% 25={indicators['ohlc_25']:.2f}% | "
+                                                f"ATR: 14={indicators['atr_14']:.2f} 28={indicators['atr_28']:.2f} | "
+                                                f"C2C: 50={indicators['c2c_50']:.2f}% 25={indicators['c2c_25']:.2f}%")
                             
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 log.warning("⚠️ Binance WebSocket closed, reconnecting...")
@@ -496,12 +615,14 @@ class DataFetcher:
                                             aggregator.add_candle(completed_candle)
                                             storage.save_candle_history(self.symbol, f"{self.interval_min}m", completed_candle)
                                             
-                                            recent_candles = aggregator.get_recent_candles(VOLATILITY_WINDOW)
-                                            indicators = engine.calculate_all(recent_candles)
+                                            # Oblicz 6 wskaźników używając wszystkich świec
+                                            all_candles = list(aggregator.candles)
+                                            indicators = engine.calculate_all(all_candles)
                                             storage.save_indicators(self.symbol, f"{self.interval_min}m", indicators)
                                             
-                                            log.info(f"📊 [Lighter] Indicators: C2C={indicators['close_to_close']:.2f}% "
-                                                    f"OHLC={indicators['ohlc']:.2f}% Chaikin={indicators['chaikin']:.2f}")
+                                            log.info(f"📊 [Lighter] OHLC: 50={indicators['ohlc_50']:.2f}% 25={indicators['ohlc_25']:.2f}% | "
+                                                    f"ATR: 14={indicators['atr_14']:.2f} 28={indicators['atr_28']:.2f} | "
+                                                    f"C2C: 50={indicators['c2c_50']:.2f}% 25={indicators['c2c_25']:.2f}%")
                                 
                                 except Exception as e:
                                     dbg.debug(f"Lighter parse error: {e}")
@@ -515,43 +636,120 @@ class DataFetcher:
             
             await asyncio.sleep(5)
 
+# ====== CANDLE REFRESH LOOP ======
+async def candle_refresh_loop(fetcher: DataFetcher, aggregator: CandleAggregator, storage: IndicatorsStorage, symbol: str, interval_min: int):
+    """Pobieraj nowe świece co CANDLE_REFRESH_INTERVAL_S sekund z REST API"""
+    log.info(f"🔄 Starting candle refresh loop: every {CANDLE_REFRESH_INTERVAL_S}s")
+    
+    while True:
+        try:
+            await asyncio.sleep(CANDLE_REFRESH_INTERVAL_S)
+            
+            # Pobierz tylko najnowsze świece (limit 20 - ostatnia godzina + 40min)
+            candles = await fetcher.fetch_rest(limit=20)
+            
+            if candles:
+                # Dodaj tylko nowe świece (sprawdź timestamp)
+                existing_times = {c['time'] for c in aggregator.candles}
+                new_candles = [c for c in candles if c['time'] not in existing_times]
+                
+                for candle in new_candles:
+                    aggregator.add_candle(candle)
+                    storage.save_candle_history(symbol, f"{interval_min}m", candle)
+                
+                if new_candles:
+                    log.info(f"🔄 [REFRESH] Added {len(new_candles)} new candles (total: {len(aggregator.candles)})")
+        
+        except Exception as e:
+            log.error(f"❌ Candle refresh error: {e}")
+            await asyncio.sleep(CANDLE_REFRESH_INTERVAL_S)
+
+# ====== CONTINUOUS UPDATE LOOP ======
+async def continuous_update_loop(fetcher: DataFetcher, aggregator: CandleAggregator, storage: IndicatorsStorage, engine: IndicatorEngine, symbol: str, interval: str):
+    """Aktualizuj wskaźniki co 10s używając CURRENT PRICE z Binance ticker!"""
+    log.info(f"⏰ Starting continuous update loop: every {UPDATE_INTERVAL_S}s with LIVE PRICE")
+    
+    while True:
+        try:
+            await asyncio.sleep(UPDATE_INTERVAL_S)
+            
+            # Pobierz CURRENT PRICE z Binance ticker
+            current_price = await fetcher.fetch_current_price()
+            
+            if current_price:
+                # Aktualizuj ostatnią świecę z current price (symuluje real-time close)
+                all_candles = list(aggregator.candles)
+                
+                if len(all_candles) >= 2:
+                    # Zaktualizuj close/high/low ostatniej świecy na podstawie current price
+                    last_candle = all_candles[-1].copy()
+                    last_candle['close'] = current_price
+                    last_candle['high'] = max(last_candle['high'], current_price)
+                    last_candle['low'] = min(last_candle['low'], current_price)
+                    
+                    # Zastąp ostatnią świecę zaktualizowaną wersją
+                    updated_candles = all_candles[:-1] + [last_candle]
+                    
+                    # Przelicz 6 wskaźników z LIVE PRICE
+                    indicators = engine.calculate_all(updated_candles)
+                    storage.save_indicators(symbol, interval, indicators)
+                    log.info(f"💹 [LIVE UPDATE] Price={current_price:.2f} | "
+                            f"OHLC: 50={indicators['ohlc_50']:.2f}% 25={indicators['ohlc_25']:.2f}% | "
+                            f"ATR: 14={indicators['atr_14']:.2f} 28={indicators['atr_28']:.2f} | "
+                            f"C2C: 50={indicators['c2c_50']:.2f}% 25={indicators['c2c_25']:.2f}%")
+        
+        except Exception as e:
+            log.error(f"❌ Update loop error: {e}")
+            await asyncio.sleep(UPDATE_INTERVAL_S)
+
 # ====== MAIN SERVICE ======
 async def run_service():
     """Uruchom serwis wskaźników"""
     log.info("🚀 Starting Indicators Service")
     log.info(f"📊 Symbol: {SYMBOL} | Interval: {CANDLE_INTERVAL_MIN}m | Buffer: {CANDLE_BUFFER_SIZE} świec")
+    log.info(f"⏱️  Update frequency: every {UPDATE_INTERVAL_S} seconds")
     
     storage = IndicatorsStorage(DB_PATH)
     aggregator = CandleAggregator(buffer_size=CANDLE_BUFFER_SIZE)
     engine = IndicatorEngine()
     fetcher = DataFetcher(SYMBOL, CANDLE_INTERVAL_MIN)
     
-    # Próbuj pobrać historię z Binance REST (optional, szybko fail)
-    log.info("⏳ Trying Binance REST for historical candles...")
+    # Pobierz początkową historię świec (BINANCE PRIMARY!)
+    log.info("⏳ Fetching initial candles from BINANCE REST...")
     try:
-        candles = await asyncio.wait_for(fetcher.fetch_rest(limit=CANDLE_BUFFER_SIZE), timeout=5.0)
+        candles = await asyncio.wait_for(fetcher.fetch_rest(limit=CANDLE_BUFFER_SIZE), timeout=10.0)
         for candle in candles:
             aggregator.add_candle(candle)
         
         if candles:
-            indicators = engine.calculate_all(aggregator.get_recent_candles(VOLATILITY_WINDOW))
+            indicators = engine.calculate_all(list(aggregator.candles))
             storage.save_indicators(SYMBOL, f"{CANDLE_INTERVAL_MIN}m", indicators)
-            log.info(f"✅ Initial indicators from Binance: C2C={indicators['close_to_close']:.2f}% "
-                    f"OHLC={indicators['ohlc']:.2f}% Chaikin={indicators['chaikin']:.2f}")
+            log.info(f"✅ Initial indicators (6 values): "
+                    f"OHLC: 50={indicators['ohlc_50']:.2f}% 25={indicators['ohlc_25']:.2f}% | "
+                    f"ATR: 14={indicators['atr_14']:.2f} 28={indicators['atr_28']:.2f} | "
+                    f"C2C: 50={indicators['c2c_50']:.2f}% 25={indicators['c2c_25']:.2f}%")
             
-            # Binance działa - użyj Binance WebSocket
-            log.info("✅ Using Binance WebSocket (PRIMARY)")
-            await fetcher.stream_websocket(aggregator, storage, engine)
+            # Uruchom background loops
+            log.info(f"✅ Starting BINANCE monitoring (candles every {CANDLE_REFRESH_INTERVAL_S}s, price every {UPDATE_INTERVAL_S}s)")
+            
+            # Start candle refresh loop (pobiera nowe świece co 60s)
+            refresh_task = asyncio.create_task(
+                candle_refresh_loop(fetcher, aggregator, storage, SYMBOL, CANDLE_INTERVAL_MIN)
+            )
+            
+            # Start indicator update loop (przelicza wskaźniki co 10s z LIVE PRICE)
+            update_task = asyncio.create_task(
+                continuous_update_loop(fetcher, aggregator, storage, engine, SYMBOL, f"{CANDLE_INTERVAL_MIN}m")
+            )
+            
+            # Keep running forever
+            await asyncio.gather(refresh_task, update_task)
         else:
-            raise Exception("No candles from Binance")
+            raise Exception("No candles from data source")
     
     except Exception as e:
-        log.warning(f"⚠️ Binance unavailable ({e}) - switching to LIGHTER FALLBACK")
-        log.info("✅ Using Lighter WebSocket (FALLBACK) - budowanie świec z ticków")
-        log.info("⏳ Pierwsze wskaźniki pojawią się za ~5 minut (czas na zbudowanie świecy)")
-        
-        # Lighter fallback - zawsze działa!
-        await fetcher.stream_lighter_websocket(aggregator, storage, engine)
+        log.error(f"❌ Failed to start service: {e}")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(run_service())
