@@ -28,8 +28,8 @@ BINANCE_WS_URL = "wss://stream.binance.com:9443/ws/btcusdt@kline_5m"
 BINANCE_REST_URL = "https://api.binance.com/api/v3/klines"
 DB_PATH = "logs/indicators_cache.db"  # SQLite fallback
 UPDATE_INTERVAL_S = 60  # Aktualizacja wskaźników co 60s
-CANDLE_BUFFER_SIZE = 50  # Ile świec 5-min przechowywać
-VOLATILITY_WINDOW = 10  # Ile świec używać do obliczeń
+CANDLE_BUFFER_SIZE = 100  # Ile świec 5-min przechowywać (500 min = 8h 20min)
+VOLATILITY_WINDOW = 20  # Ile świec używać do obliczeń (100 min = 1h 40min)
 
 # PostgreSQL (Railway) - auto-detect
 DATABASE_URL = os.getenv("DATABASE_URL")  # Railway provides this
@@ -207,7 +207,7 @@ class IndicatorEngine:
     
     @staticmethod
     def calculate_close_to_close_volatility(candles: List[Dict]) -> float:
-        """Close-to-Close Volatility = StdDev(log returns) * sqrt(periods) * 100"""
+        """Close-to-Close Volatility (Annualized) = StdDev(log returns) * sqrt(252) * 100"""
         if len(candles) < 2:
             return 0.0
         
@@ -222,30 +222,60 @@ class IndicatorEngine:
         if not log_returns:
             return 0.0
         
-        mean_ret = sum(log_returns) / len(log_returns)
-        variance = sum((r - mean_ret) ** 2 for r in log_returns) / len(log_returns)
+        # Standard deviation (bez odejmowania średniej - assumption: zero drift dla crypto intraday)
+        variance = sum(r ** 2 for r in log_returns) / len(log_returns)
         std_dev = math.sqrt(variance)
         
-        volatility_pct = std_dev * math.sqrt(len(log_returns)) * 100
+        # Annualizacja: 5-min świece, 288 świec/dzień (24h crypto), 252 dni handlowe
+        # sqrt(252 * 288) = sqrt(72576) ≈ 269.4
+        ANNUALIZATION_FACTOR = 269.4
+        
+        volatility_pct = std_dev * ANNUALIZATION_FACTOR * 100
         return volatility_pct
     
     @staticmethod
     def calculate_ohlc_volatility(candles: List[Dict]) -> float:
-        """OHLC Volatility = Średnia((High - Low) / Close) * 100"""
-        if not candles:
+        """Garman-Klass OHLC Volatility (Annualized)"""
+        if len(candles) < 2:
             return 0.0
         
-        hl_ratios = []
+        # Garman-Klass formula:
+        # σ² = (1/n) * Σ[ 0.5 * ln(H/L)² - (2*ln(2)-1) * ln(C/O)² ]
+        # σ_annual = σ * sqrt(252 * periods_per_day)
+        
+        n = len(candles)
+        sum_variance = 0.0
+        
         for c in candles:
-            if c['close'] > 0:
-                hl_ratio = (c['high'] - c['low']) / c['close']
-                hl_ratios.append(hl_ratio)
+            if c['high'] > 0 and c['low'] > 0 and c['open'] > 0 and c['close'] > 0:
+                # High/Low component
+                hl_ratio = math.log(c['high'] / c['low'])
+                hl_component = 0.5 * (hl_ratio ** 2)
+                
+                # Close/Open component
+                co_ratio = math.log(c['close'] / c['open'])
+                co_component = (2 * math.log(2) - 1) * (co_ratio ** 2)  # ≈ 0.3863 * co_ratio²
+                
+                # Combine
+                period_variance = hl_component - co_component
+                sum_variance += period_variance
         
-        if not hl_ratios:
+        if sum_variance <= 0:
             return 0.0
         
-        avg_hl_ratio = sum(hl_ratios) / len(hl_ratios)
-        return avg_hl_ratio * 100
+        # Average variance per period
+        avg_variance = sum_variance / n
+        
+        # Annualize: 5-min candles, 288 periods/day, 252 trading days
+        # Factor = 252 * 288 / n (where n is lookback window)
+        PERIODS_PER_DAY = 288  # 24h * 60min / 5min
+        TRADING_DAYS = 252
+        annualization_factor = (TRADING_DAYS * PERIODS_PER_DAY) / n
+        
+        annualized_variance = avg_variance * annualization_factor
+        volatility_pct = math.sqrt(annualized_variance) * 100
+        
+        return volatility_pct
     
     @staticmethod
     def calculate_chaikin_volatility(candles: List[Dict], ema_period: int = 10) -> float:
