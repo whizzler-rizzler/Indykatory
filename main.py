@@ -7,4 +7,4 @@ import subprocess
 import sys
 
 if __name__ == "__main__":
-    subprocess.run([sys.executable, "src/indicators_service.py"])
+    subprocess.run([sys.executable, "indicators_service.py"])
